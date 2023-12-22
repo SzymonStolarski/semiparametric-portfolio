@@ -9,7 +9,7 @@ def portfolio_return(X: pd.DataFrame, weights: list):
 
 
 def portfolio_volatility(
-        X:pd.DataFrame,
+        X: pd.DataFrame,
         weights: list,
         measure: Literal['std', 'var'] = 'std'):
     
