@@ -1,29 +1,20 @@
 from copy import deepcopy
+from datetime import datetime
 
 from copulae.archimedean import ClaytonCopula, FrankCopula, GumbelCopula
 from copulae.elliptical import GaussianCopula, StudentCopula
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.integrate import simps
-from scipy.stats import bootstrap, norm
-from sklearn.metrics import mean_squared_error
-from sklearn.neighbors import KernelDensity
 from sklearn.pipeline import Pipeline
-from statsmodels.nonparametric.bandwidths import bw_silverman, bw_scott
 
-from components.functions.portfolio import portfolio_return, portfolio_volatility
 from components.transformers.rate_transformer import RateTransformer
 from components.transformers.log_transformer import LognTransformer
-from components.wrappers.cvxpy_wrapper import CVXPYWrapper
 from components.wrappers.kde_wrapper import KernelDensityWrapper
+from components.evaluate.cv.monthly_splitters import ExpandingMonthlySplitter, SlidingMonthlySplitter
+from components.evaluate.evaluate import evaluate
 
 
-X_TRAIN_START = '2010-01-01'
-X_TRAIN_END = '2022-12-30'
-X_TEST_START = '2023-01-02'
-X_TEST_END = '2023-02-28'
-
+RANDOM_SEED = 5
 
 SELECTED_PORTFOLIOS = {
     'P1': ['Nickel', 'Copper'],
@@ -43,7 +34,9 @@ KERNEL = 'epanechnikov'
 # 'silverman', 'scott', float
 KERNEL_BANDWIDTH = 'silverman'
 
-# Copula
+# 'gaussian', 'student', 'frank', 'clayton', 'gumbel'
+COPULA = 'student'
+
 copula_dict = {
     'gaussian': GaussianCopula,
     'student': StudentCopula,
@@ -51,15 +44,18 @@ copula_dict = {
     'clayton': ClaytonCopula,
     'gumbel': GumbelCopula
 }
-# 'gaussian', 'student', 'frank', 'clayton', 'gumbel'
-COPULA = 'student'
-# N_COPULA_SIMULATIONS = 10000
-RANDOM_SEED = 5
 
-# Portfolio simulations
-WEIGHT_SIMULATIONS = 10000
+# Cross validation configuration
+# expanding window
+CV = ExpandingMonthlySplitter(
+    initial_window=150, step_length=1, test_horizon=1)
+# sliding window
+# CV = SlidingMonthlySplitter(
+#     initial_window=130, step_length=1, test_horizon=1, window_length=24)
 
-assets_in_portfolios = list(set([i for j in SELECTED_PORTFOLIOS.values() for i in j]))
+
+assets_in_portfolios = list(
+    set([i for j in SELECTED_PORTFOLIOS.values() for i in j]))
 assets_in_portfolios.append(SELECTED_BENCHMARK)
 
 # Load data
@@ -83,67 +79,40 @@ df_transformed = log_rate_pipe.fit_transform(X=df)
 # Drop all the `na` values
 df_transformed.dropna(inplace=True)
 
-
-# train/test split - currently only one split
-# Select dataset to train (fit) and test
-X_train = df_transformed.loc[X_TRAIN_START:X_TRAIN_END]
-X_test = df_transformed.loc[X_TEST_START:X_TEST_END]
-
-# density estimation
-kdw = KernelDensityWrapper(bandwidth='silverman')
-kdw.fit(X_train)
-X_train_cdf_vals = kdw.cdf(X_train)
-
+# Evaluation part
 results_df = pd.DataFrame()
 for portfolio, assets in SELECTED_PORTFOLIOS.items():
-    # copula fit
-    copula = copula_dict[COPULA](dim=len(assets))
-    copula.fit(X_train_cdf_vals[assets], to_pobs=False, verbose=False)
-    # Simulate cdf values from the copula
-    copula_simulations = copula.random(n=len(X_train_cdf_vals), seed=RANDOM_SEED)
-    # Map the copula cdfs back to returns via the nonparametric distributions
-    copula_simulation_values = kdw.ppf(copula_simulations)
 
-    # model optimization
-    model_markowitz = CVXPYWrapper()
-    model_markowitz.fit(X_train[assets])
-    markowitz_weights = model_markowitz.weights
+    X = df_transformed[assets]
+    X_benchmark = df_transformed[SELECTED_BENCHMARK]
 
-    model_semiparametric = CVXPYWrapper()
-    model_semiparametric.fit(copula_simulation_values)
-    semiparametric_weights = model_semiparametric.weights
+    portfolio_results_df = evaluate(
+        X=X,
+        X_benchmark=X_benchmark,
+        kernel=KernelDensityWrapper(kernel=KERNEL, bandwidth=KERNEL_BANDWIDTH),
+        copula=copula_dict[COPULA](dim=len(assets)),
+        cv=CV,
+        random_seed=RANDOM_SEED,
+        n_copula_simulations=X.shape[0]
+    )
+    portfolio_results_df['Portfolio'] = portfolio
+    portfolio_results_df['Assets'] = [
+        assets for _ in range(0, len(portfolio_results_df))]
+    
+    results_df = pd.concat(
+        [results_df, portfolio_results_df], ignore_index=True)
 
-    # testing
-    testing_portfolio = X_test[assets]
-    testing_benchmark = X_test[SELECTED_BENCHMARK]
+col_order = ['Portfolio', 'Assets']
+col_order.extend(portfolio_results_df.columns[:-2])
 
-    markowitz_return = portfolio_return(testing_portfolio, list(markowitz_weights.values()))
-    semiparametric_return = portfolio_return(testing_portfolio, list(semiparametric_weights.values()))
-    markowitz_volatility = portfolio_volatility(testing_portfolio, list(markowitz_weights.values()))
-    semiparametric_volatility = portfolio_volatility(testing_portfolio, list(semiparametric_weights.values()))
+results_df = results_df[col_order]
 
-    benchmark_return = testing_benchmark.mean()
-    benchmark_volatility = testing_benchmark.std()
+# Prep data for saving and save into excel file
+results_condensed = deepcopy(results_df)
+results_condensed['Markowitz weights'] = [
+    np.around(i, 5) for i in results_condensed['Markowitz weights'].values]
+results_condensed['Semiparametric weights'] = [
+    np.around(i, 5) for i in results_condensed['Semiparametric weights'].values]
 
-    markowitz_sharpe = (markowitz_return-benchmark_return)/markowitz_volatility
-    semiparametric_sharpe = (semiparametric_return-benchmark_return)/semiparametric_volatility
-
-    row = pd.DataFrame({
-        'Portfolio': [portfolio],
-        'Assets': [assets],
-        'Train period': [[X_TRAIN_START, X_TRAIN_END]],
-        'Test period': [[X_TEST_START, X_TEST_END]],
-        'Markowitz weights': [list(markowitz_weights.values())],
-        'Semiparametric weights': [list(semiparametric_weights.values())],
-        'Markowitz return': [markowitz_return],
-        'Semiparametric return': [semiparametric_return],
-        f'Benchmark {SELECTED_BENCHMARK} return': [benchmark_return],
-        'Markowitz volatility': [markowitz_volatility],
-        'Semiparametric volatility': [semiparametric_volatility],
-        f'Benchmark {SELECTED_BENCHMARK} volatility': [benchmark_volatility],
-        'Markowitz sharpe': [markowitz_sharpe],
-        'Semiparametric sharpe': [semiparametric_sharpe]
-    })
-    results_df = pd.concat([results_df, row], ignore_index=True)
-
-print(results_df.head())
+results_condensed.to_excel(
+    f"results_{datetime.now().strftime('%d_%m_%Y_%H_%M_%S')}.xlsx", index=False)
